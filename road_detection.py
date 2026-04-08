@@ -49,7 +49,7 @@ VEG_IDS = {              # tree, grass, earth, mountain, plant, field, hill, roc
 COL_SKY        = dict(bgr=(200, 160,  50), rgb=(50, 160, 200))   # sky-blue
 COL_VEG        = dict(bgr=( 30, 100,  30), rgb=(30, 100,  30))   # dark green
 COL_ASPHALT    = dict(bgr=( 30, 100, 255), rgb=(255, 100,  30))   # orange
-COL_GRAVEL     = dict(bgr=( 30, 220,  80), rgb=(80, 220,  30))   # lime green
+COL_GRAVEL     = dict(bgr=(200,  40, 160), rgb=(160,  40, 200))  # purple
 COL_OTHER      = dict(bgr=(100, 100, 100), rgb=(100, 100, 100))  # gray
 
 LV_RATIO_THR = 0.876   # primary gravel/asphalt decision boundary
@@ -89,8 +89,13 @@ def run_segformer(image_path, processor, model, device):
 def make_class_masks(seg_map, bgr):
     """
     Build boolean masks for each semantic group.
-    Road mask is further restricted to the lower 65 % of the frame
-    and cleaned with morphological ops.
+
+    Returns
+    -------
+    sky_mask      : full sky region
+    veg_mask      : full vegetation region
+    road_mask     : full road region (used for texture classification)
+    road_vis_mask : road region capped at 40 % coverage (used for display only)
     """
     H, W = seg_map.shape
 
@@ -121,7 +126,24 @@ def make_class_masks(seg_map, bgr):
         road_mask[int(H * 0.5):, int(W * 0.1):int(W * 0.9)] = True
         print("  [WARN] sparse road mask – applied centre-bottom fallback")
 
-    return sky_mask, veg_mask, road_mask
+    # ── visual mask: cap at 40 % (keep bottom-most pixels) ───────────────────
+    # Keeps the overlay tidy; texture classification still uses the full mask.
+    road_vis_mask = road_mask.copy()
+    MAX_VIS_COV = 0.40
+    vis_cov = road_vis_mask.sum() / road_vis_mask.size
+    if vis_cov > MAX_VIS_COV:
+        target      = int(road_vis_mask.size * MAX_VIS_COV)
+        accumulated = 0
+        cutoff_row  = 0
+        for row in range(H - 1, -1, -1):
+            accumulated += int(road_vis_mask[row].sum())
+            if accumulated >= target:
+                cutoff_row = row
+                break
+        road_vis_mask[:cutoff_row, :] = False
+        print(f"  [INFO] visual road cov {vis_cov:.0%} → capped at {MAX_VIS_COV:.0%} for display")
+
+    return sky_mask, veg_mask, road_mask, road_vis_mask
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -375,30 +397,31 @@ def main():
 
         # 1. Segment
         seg_map = run_segformer(img_path, processor, model, device)
-        sky_mask, veg_mask, road_mask = make_class_masks(seg_map, bgr)
+        sky_mask, veg_mask, road_mask, road_vis_mask = make_class_masks(seg_map, bgr)
 
-        cov = road_mask.sum() / road_mask.size
-        sky_cov = sky_mask.sum() / sky_mask.size
-        veg_cov = veg_mask.sum() / veg_mask.size
-        print(f"  Coverage  road={cov:.1%}  sky={sky_cov:.1%}  veg={veg_cov:.1%}")
+        cov     = road_mask.sum()     / road_mask.size
+        vis_cov = road_vis_mask.sum() / road_vis_mask.size
+        sky_cov = sky_mask.sum()      / sky_mask.size
+        veg_cov = veg_mask.sum()      / veg_mask.size
+        print(f"  Coverage  road={cov:.1%}(full)/{vis_cov:.1%}(vis)  sky={sky_cov:.1%}  veg={veg_cov:.1%}")
 
-        # 2. Classify road type
+        # 2. Classify road type – uses full mask for accurate texture stats
         label, score, features = classify_road_type(bgr, road_mask)
         conf = score if label == "gravel" else 1 - score
         print(f"  lv_ratio={features['lv_ratio']:.4f}  →  {label.upper()} ({conf:.0%})")
 
-        # 3. Save outputs
+        # 3. Save outputs – uses visual mask for clean overlay
         stem       = img_path.stem.replace(" ", "_")
-        result_bgr = build_coloured_overlay(bgr, sky_mask, veg_mask, road_mask, label)
-        result_bgr = add_banner(result_bgr, label, score, road_mask)
+        result_bgr = build_coloured_overlay(bgr, sky_mask, veg_mask, road_vis_mask, label)
+        result_bgr = add_banner(result_bgr, label, score, road_vis_mask)
         cv2.imwrite(str(OUT_DIR / f"{stem}_result.jpg"), result_bgr)
 
-        save_panel(bgr, sky_mask, veg_mask, road_mask, label, score, features,
+        save_panel(bgr, sky_mask, veg_mask, road_vis_mask, label, score, features,
                    OUT_DIR / f"{stem}_panel.png", title=img_path.name)
 
         results.append(dict(name=img_path.stem, bgr=bgr,
                             sky_mask=sky_mask, veg_mask=veg_mask,
-                            road_mask=road_mask, label=label, score=score,
+                            road_mask=road_vis_mask, label=label, score=score,
                             features=features))
         print()
 
