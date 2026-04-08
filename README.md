@@ -84,6 +84,34 @@ python road_detection.py
 
 ---
 
+## 輸出結果對照
+
+### 整體總結（6 張）
+
+![Summary](output/summary.png)
+
+---
+
+### 逐張前後對照（原圖 / 語意遮罩 / 結果）
+
+#### 柏油路（Asphalt）
+
+![asphalt_road_1](output/asphalt_road_1_panel.png)
+
+![asphalt_road_2](output/asphalt_road_2_panel.png)
+
+![asphalt_road_3](output/asphalt_road_3_panel.png)
+
+#### 碎石路（Gravel）
+
+![gravel_road_1](output/gravel_road_1_panel.png)
+
+![gravel_road_2](output/gravel_road_2_panel.png)
+
+![gravel_road_3](output/gravel_road_3_panel.png)
+
+---
+
 ## 模型說明
 
 - **分割模型**：`nvidia/segformer-b2-finetuned-ade-512-512`（HuggingFace Transformers）
