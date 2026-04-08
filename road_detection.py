@@ -86,6 +86,125 @@ def run_segformer(image_path, processor, model, device):
     return seg_map
 
 
+def _gradient_taper_mask(road_mask: np.ndarray, upper_cut: int,
+                          top_frac: float = 0.20) -> np.ndarray:
+    """
+    Create a perspective-tapered version of road_mask.
+    Each row keeps the same centre as the SegFormer mask, but the width
+    shrinks linearly from 100 % at the bottom to `top_frac` % at upper_cut.
+
+    This gives the natural 'vanishing road' look without relying on lane markings.
+    """
+    H, W = road_mask.shape
+    tapered = np.zeros_like(road_mask)
+
+    for row in range(upper_cut, H):
+        cols = np.where(road_mask[row])[0]
+        if len(cols) == 0:
+            continue
+        c_min, c_max = int(cols[0]), int(cols[-1])
+        center   = (c_min + c_max) / 2.0
+        half_w   = (c_max - c_min) / 2.0
+
+        # t = 0 at upper_cut (top), t = 1 at H-1 (bottom)
+        t = (row - upper_cut) / max(1, H - 1 - upper_cut)
+        taper_hw = half_w * (top_frac + (1.0 - top_frac) * t)
+
+        x0 = max(0,     int(center - taper_hw))
+        x1 = min(W - 1, int(center + taper_hw))
+        tapered[row, x0 : x1 + 1] = True
+
+    return tapered & road_mask
+
+
+def _hough_road_polygon(bgr, upper_cut: int) -> np.ndarray | None:
+    """
+    Detect lane lines with Hough transform and return a filled
+    perspective polygon (H×W bool), or None if detection fails.
+
+    The polygon covers the road corridor from the bottom up to
+    approximately the vanishing-point row.
+    """
+    H, W = bgr.shape[:2]
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+
+    # Work only in the road region
+    roi = gray[upper_cut:].copy()
+    roi_h = roi.shape[0]
+
+    blur  = cv2.GaussianBlur(roi, (7, 7), 0)
+    edges = cv2.Canny(blur, 40, 120)
+
+    lines = cv2.HoughLinesP(edges, rho=1, theta=np.pi / 180,
+                             threshold=40, minLineLength=60, maxLineGap=50)
+    if lines is None:
+        return None
+
+    cx = W // 2
+    left_pts, right_pts = [], []
+
+    for line in lines:
+        x1, y1, x2, y2 = line[0]
+        if x2 == x1:
+            continue
+        slope = (y2 - y1) / (x2 - x1)
+        # Convert ROI-relative y to full-image y
+        y1f, y2f = y1 + upper_cut, y2 + upper_cut
+
+        # Left lane: negative slope, left half
+        if -5.0 < slope < -0.25 and min(x1, x2) < cx:
+            left_pts += [(x1, y1f), (x2, y2f)]
+        # Right lane: positive slope, right half
+        elif 0.25 < slope < 5.0 and max(x1, x2) > cx:
+            right_pts += [(x1, y1f), (x2, y2f)]
+
+    def extrapolate(pts, y_bot, y_top):
+        if len(pts) < 4:
+            return None, None
+        arr = np.array(pts)
+        coeffs = np.polyfit(arr[:, 1], arr[:, 0], 1)   # x = f(y)
+        return int(np.polyval(coeffs, y_bot)), int(np.polyval(coeffs, y_top))
+
+    y_bottom = H - 1
+    y_top    = upper_cut + max(20, int(roi_h * 0.15))   # ~15 % above upper_cut
+
+    lx_b, lx_t = extrapolate(left_pts,  y_bottom, y_top)
+    rx_b, rx_t = extrapolate(right_pts, y_bottom, y_top)
+
+    if lx_b is None or rx_b is None:
+        return None
+
+    # Clamp to image bounds
+    def clamp(x): return max(0, min(W - 1, x))
+    lx_b, lx_t = clamp(lx_b), clamp(lx_t)
+    rx_b, rx_t = clamp(rx_b), clamp(rx_t)
+
+    # Sanity: left must be left of right
+    if lx_b >= rx_b or lx_t >= rx_t:
+        return None
+
+    poly_pts = np.array([[lx_b, y_bottom], [rx_b, y_bottom],
+                          [rx_t, y_top],   [lx_t, y_top]], dtype=np.int32)
+    poly = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(poly, [poly_pts], 1)
+    return poly.astype(bool)
+
+
+def _default_trapezoid(H, W, upper_cut: int) -> np.ndarray:
+    """
+    Fallback: fixed trapezoid centred on the lower image.
+    Narrow at the top (~30 % width), wide at the bottom (full width).
+    """
+    bx0, bx1 = int(W * 0.00), int(W * 1.00)
+    tx0, tx1 = int(W * 0.30), int(W * 0.70)
+    ty        = upper_cut + max(10, int((H - upper_cut) * 0.10))
+    pts = np.array([[bx0, H - 1], [bx1, H - 1],
+                    [tx1, ty],    [tx0, ty]], dtype=np.int32)
+    trap = np.zeros((H, W), dtype=np.uint8)
+    cv2.fillPoly(trap, [pts], 1)
+    return trap.astype(bool)
+
+
 def make_class_masks(seg_map, bgr):
     """
     Build boolean masks for each semantic group.
@@ -95,7 +214,7 @@ def make_class_masks(seg_map, bgr):
     sky_mask      : full sky region
     veg_mask      : full vegetation region
     road_mask     : full road region (used for texture classification)
-    road_vis_mask : road region capped at 40 % coverage (used for display only)
+    road_vis_mask : perspective-shaped road polygon (used for display only)
     """
     H, W = seg_map.shape
 
@@ -121,27 +240,23 @@ def make_class_masks(seg_map, bgr):
         road_mask = (labels == largest)
 
     # ── fallback if road mask too small ──────────────────────────────────────
-    cov = road_mask.sum() / road_mask.size
-    if cov < 0.03:
+    if road_mask.sum() / road_mask.size < 0.03:
         road_mask[int(H * 0.5):, int(W * 0.1):int(W * 0.9)] = True
         print("  [WARN] sparse road mask – applied centre-bottom fallback")
 
-    # ── visual mask: cap at 40 % (keep bottom-most pixels) ───────────────────
-    # Keeps the overlay tidy; texture classification still uses the full mask.
-    road_vis_mask = road_mask.copy()
-    MAX_VIS_COV = 0.40
-    vis_cov = road_vis_mask.sum() / road_vis_mask.size
-    if vis_cov > MAX_VIS_COV:
-        target      = int(road_vis_mask.size * MAX_VIS_COV)
-        accumulated = 0
-        cutoff_row  = 0
-        for row in range(H - 1, -1, -1):
-            accumulated += int(road_vis_mask[row].sum())
-            if accumulated >= target:
-                cutoff_row = row
-                break
-        road_vis_mask[:cutoff_row, :] = False
-        print(f"  [INFO] visual road cov {vis_cov:.0%} → capped at {MAX_VIS_COV:.0%} for display")
+    # ── visual mask: use Hough polygon only when SegFormer over-detects ─────
+    # For normal images (coverage ≤ 45 %) keep the SegFormer shape as-is.
+    # For wide/flat over-detections (coverage > 45 %) apply a Hough polygon
+    # so the road tapers naturally toward the vanishing point.
+    seg_cov = road_mask.sum() / road_mask.size
+    if seg_cov > 0.45:
+        # SegFormer over-detected: apply gradient taper so the road
+        # narrows naturally toward the vanishing point.
+        road_vis_mask = _gradient_taper_mask(road_mask, upper_cut, top_frac=0.15)
+        new_cov = road_vis_mask.sum() / road_vis_mask.size
+        print(f"  [INFO] coverage high ({seg_cov:.0%}) → gradient taper applied ({new_cov:.0%})")
+    else:
+        road_vis_mask = road_mask.copy()   # SegFormer shape is fine
 
     return sky_mask, veg_mask, road_mask, road_vis_mask
 
@@ -325,9 +440,11 @@ def save_panel(bgr, sky_mask, veg_mask, road_mask, road_label,
 
 
 def save_summary(results, out_path):
-    """2×3 summary grid."""
-    fig = plt.figure(figsize=(24, 16), facecolor="#12121f")
-    gs  = gridspec.GridSpec(2, 3, wspace=0.05, hspace=0.15)
+    """Dynamic summary grid (cols=3, rows adjusted to fit)."""
+    n_cols = 3
+    n_rows = max(1, (len(results) + n_cols - 1) // n_cols)
+    fig = plt.figure(figsize=(24, 8 * n_rows), facecolor="#12121f")
+    gs  = gridspec.GridSpec(n_rows, n_cols, wspace=0.05, hspace=0.15)
 
     for i, r in enumerate(results):
         bgr        = r["bgr"]
@@ -379,6 +496,7 @@ def main():
     image_paths = sorted(
         p for p in IMAGE_DIR.glob("*")
         if p.suffix.lower() in {".jpg", ".jpeg", ".png"}
+        and "road" in p.name.lower()
     )
     if not image_paths:
         print("[ERROR] No images found in images/")
