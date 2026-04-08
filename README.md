@@ -1,74 +1,108 @@
-# Road Surface Detection: Gravel vs Asphalt
+# 道路表面偵測：碎石路 vs 柏油路
 
-Semantic segmentation pipeline that detects road regions and classifies them as **gravel** or **asphalt** using a hybrid deep-learning + texture-analysis approach.
+利用語意分割（Semantic Segmentation）技術自動識別道路表面類型（gravel / asphalt），並以不同顏色標示天空、植被與道路區域。
 
-## Architecture
+---
+
+## 系統架構
 
 ```
-Input Image
+輸入圖片
     │
     ▼
-SegFormer-B2 (ADE20K)          ← road/path/dirt-track pixel mask
+SegFormer-B2（ADE20K 預訓練）     ← 語意分割：道路 / 天空 / 植被 / 其他
     │
     ▼
-Multi-Feature Texture Analysis
-    ├── FFT High-Frequency Energy Ratio  (30%)
-    ├── Sobel Edge Density               (25%)
-    ├── LBP Variance                     (20%)
-    ├── Colour Standard Deviation        (15%)
-    └── Mean Intensity                   (10%)
+多特徵紋理分析（Texture Analysis）
+    ├── lv_ratio（細/粗局部方差比）  ← 主要判斷依據（權重 35%）
+    ├── Sobel 邊緣密度               （權重 25%）
+    ├── Laplacian 方差               （權重 25%）
+    └── 平均亮度                     （權重 15%）
     │
     ▼
-Weighted Score → Gravel / Asphalt
+加權分數 → Gravel（碎石路）或 Asphalt（柏油路）
     │
     ▼
-Colour-Overlay Output Image
+多類別彩色疊加輸出圖片
 ```
 
-## Setup
+---
+
+## 顏色對照表
+
+| 區域 | 顏色 |
+|------|------|
+| 天空（Sky） | 天藍色 |
+| 植被 / 路邊（Vegetation） | 深綠色 |
+| 柏油路（Asphalt） | 橘色 |
+| 碎石路（Gravel） | 萊姆綠 |
+| 其他（Other） | 灰色 |
+
+---
+
+## 安裝環境
 
 ```bash
 pip install -r requirements.txt
 ```
 
-> Requires Python ≥ 3.10. GPU recommended (CUDA 12+), falls back to CPU.
+> 需求：Python ≥ 3.10，建議使用 GPU（CUDA 12+），無 GPU 時自動切換 CPU 執行。
 
-## Usage
+---
+
+## 使用方式
+
+1. 將待測圖片放入 `images/` 資料夾
+2. 執行主程式：
 
 ```bash
-# Place images in  images/  directory, then:
 python road_detection.py
 ```
 
-Output images are written to `output/`:
+結果圖片輸出至 `output/` 資料夾：
 
-| File | Description |
-|------|-------------|
-| `{name}_result.jpg` | Original with colour overlay (OpenCV) |
-| `{name}_panel.png`  | 3-panel: original / mask / result (matplotlib) |
-| `summary.png`       | 2×3 grid of all results |
+| 輸出檔案 | 說明 |
+|----------|------|
+| `{name}_result.jpg` | 彩色疊加圖（含圖例與信心值） |
+| `{name}_panel.png`  | 三欄對照圖：原圖 / 語意遮罩 / 結果 |
+| `summary.png`       | 6 張圖統整總結（2×3 格）       |
 
-## Results
+---
 
-- **Green overlay** → Gravel road
-- **Orange overlay** → Asphalt road
+## 測試圖片
 
-Feature scores printed per image; accuracy table shown at the end.
+| 檔案 | 正確答案 |
+|------|---------|
+| asphalt road_1.jpg | 柏油路 |
+| asphalt road_2.jpg | 柏油路 |
+| asphalt road_3.jpg | 柏油路 |
+| gravel road_1.jpg  | 碎石路 |
+| gravel road_2.jpeg | 碎石路 |
+| gravel road_3.jpg  | 碎石路 |
 
-## Test Images
+**測試準確率：6/6 = 100%**
 
-| File | Ground Truth |
-|------|-------------|
-| asphalt road_1.jpg | Asphalt |
-| asphalt road_2.jpg | Asphalt |
-| asphalt road_3.jpg | Asphalt |
-| gravel road_1.jpg  | Gravel  |
-| gravel road_2.jpeg | Gravel  |
-| gravel road_3.jpg  | Gravel  |
+---
 
-## Model
+## 模型說明
 
-Pre-trained **SegFormer-B2** fine-tuned on ADE20K 150-class dataset  
-(`nvidia/segformer-b2-finetuned-ade-512-512` via HuggingFace Transformers).
+- **分割模型**：`nvidia/segformer-b2-finetuned-ade-512-512`（HuggingFace Transformers）
+  - 使用 ADE20K 150 類預訓練，識別 road / sidewalk / path / dirt track / sky / tree / grass 等類別
+- **分類方法**：不需額外訓練資料，透過手工設計的加權紋理評分判斷路面類型
 
-Road-type classification is performed by a hand-crafted weighted scorer applied to texture features extracted from the segmented road region — no additional training data required.
+### 核心特徵：lv_ratio
+
+$$\text{lv\_ratio} = \frac{\overline{\sigma_{5 \times 5}}}{\overline{\sigma_{15 \times 15}}}$$
+
+- 計算路面區域在細尺度（5×5）與粗尺度（15×15）局部方差的比值
+- 碎石路（gravel）的細尺度紋理相對豐富 → lv_ratio 較高（≥ 0.876）
+- 柏油路（asphalt）表面平滑 → lv_ratio 較低（< 0.876）
+
+---
+
+## 技術細節
+
+- 道路遮罩限制在圖片下方 65%，排除天空遠景誤判
+- 形態學開閉運算（kernel 11×11）去除小雜訊區域
+- 保留最大連通分量，確保只標記主要道路
+- 支援 EXIF 旋轉校正，避免手機直拍圖片方向錯誤
