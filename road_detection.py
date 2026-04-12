@@ -86,35 +86,114 @@ def run_segformer(image_path, processor, model, device):
     return seg_map
 
 
-def _gradient_taper_mask(road_mask: np.ndarray, upper_cut: int,
-                          top_frac: float = 0.20) -> np.ndarray:
+def _monotonic_taper_mask(road_mask: np.ndarray, upper_cut: int,
+                           smooth_alpha: float = 0.3) -> np.ndarray:
     """
-    Create a perspective-tapered version of road_mask.
-    Each row keeps the same centre as the SegFormer mask, but the width
-    shrinks linearly from 100 % at the bottom to `top_frac` % at upper_cut.
+    Perspective-correct visual mask: scan bottom→top enforcing that road
+    half-width can only DECREASE (road narrows toward the vanishing point).
+    Center position is exponentially smoothed to follow gentle road curves.
 
-    This gives the natural 'vanishing road' look without relying on lane markings.
+    This naturally handles wide/flat SegFormer detections (e.g. wet roads
+    where SegFormer sees full-width road at every row) without producing
+    the rectangular artefact that a linear gradient taper creates.
     """
     H, W = road_mask.shape
-    tapered = np.zeros_like(road_mask)
+    result = np.zeros_like(road_mask)
 
-    for row in range(upper_cut, H):
+    prev_hw  = None        # previous half-width (None = not yet started)
+    prev_ctr = W / 2.0
+
+    for row in range(H - 1, upper_cut - 1, -1):       # bottom → top
         cols = np.where(road_mask[row])[0]
-        if len(cols) == 0:
+
+        if len(cols) < 10:
+            # No road pixels here; if already tracking, gently shrink
+            if prev_hw is not None:
+                prev_hw = max(5.0, prev_hw * 0.94)    # ~6 % narrower per row
+                x0 = max(0,     int(prev_ctr - prev_hw))
+                x1 = min(W - 1, int(prev_ctr + prev_hw))
+                result[row, x0:x1 + 1] = True
             continue
-        c_min, c_max = int(cols[0]), int(cols[-1])
-        center   = (c_min + c_max) / 2.0
-        half_w   = (c_max - c_min) / 2.0
 
-        # t = 0 at upper_cut (top), t = 1 at H-1 (bottom)
-        t = (row - upper_cut) / max(1, H - 1 - upper_cut)
-        taper_hw = half_w * (top_frac + (1.0 - top_frac) * t)
+        seg_hw  = (int(cols[-1]) - int(cols[0])) / 2.0
+        seg_ctr = (int(cols[0])  + int(cols[-1])) / 2.0
 
-        x0 = max(0,     int(center - taper_hw))
-        x1 = min(W - 1, int(center + taper_hw))
-        tapered[row, x0 : x1 + 1] = True
+        if prev_hw is None:
+            # Bottom-most valid road row — use SegFormer directly
+            curr_hw  = seg_hw
+            curr_ctr = seg_ctr
+        else:
+            # Monotonic constraint: width can only decrease going up
+            curr_hw  = min(seg_hw, prev_hw)
+            # Smooth center shift (allows gentle road curves)
+            curr_ctr = (1.0 - smooth_alpha) * prev_ctr + smooth_alpha * seg_ctr
 
-    return tapered & road_mask
+        x0 = max(0,     int(curr_ctr - curr_hw))
+        x1 = min(W - 1, int(curr_ctr + curr_hw))
+        result[row, x0:x1 + 1] = True
+        prev_hw  = curr_hw
+        prev_ctr = curr_ctr
+
+    return result & road_mask
+
+
+def _detect_red_line_bounds(bgr: np.ndarray, upper_cut: int) -> np.ndarray | None:
+    """
+    Detect red no-parking lines (台灣禁止停車紅線) and return a boolean mask
+    covering the area INSIDE the red lines (i.e. the road corridor they bound).
+
+    Red paint in HSV: H ∈ [0,12] ∪ [168,180], S > 80, V > 50.
+    The detected red pixels are dilated and used as a fill boundary so the
+    road mask stays within the lane delimited by the red kerb lines.
+
+    Returns None when no significant red lines are found.
+    """
+    H, W = bgr.shape[:2]
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+
+    # Red wraps around H=0 in HSV
+    r1 = cv2.inRange(hsv, (0,   80, 50), (12,  255, 255))
+    r2 = cv2.inRange(hsv, (168, 80, 50), (180, 255, 255))
+    red = cv2.bitwise_or(r1, r2)
+
+    # Only consider road zone
+    red[:upper_cut] = 0
+
+    # Connect broken segments along horizontal / diagonal direction
+    kh = cv2.getStructuringElement(cv2.MORPH_RECT, (40, 3))
+    red = cv2.morphologyEx(red, cv2.MORPH_CLOSE, kh)
+
+    red_px = int(red.sum() / 255)
+    road_px = (H - upper_cut) * W
+
+    # Require meaningful coverage AND that red lines span multiple rows
+    red_bin = (red > 0)
+    active_rows = int(red_bin[upper_cut:].any(axis=1).sum())
+    if red_px < road_px * 0.015 or active_rows < 8:   # < 1.5 % or < 8 rows → ignore
+        return None
+
+    # Additional sanity: the red region must span at least 25 % image width
+    # (lane-boundary lines are long, not scattered small patches)
+    red_cols = np.where(red_bin.any(axis=0))[0]
+    if len(red_cols) == 0 or (red_cols[-1] - red_cols[0]) < W * 0.25:
+        return None
+
+    print(f"  [INFO] Red boundary lines detected ({red_px / road_px:.1%} of road zone)")
+
+    # Build "inside-lines" mask:
+    # For each row find the leftmost and rightmost red pixel;
+    # fill between them (those are the road lane bounds).
+    inside = np.zeros((H, W), dtype=np.uint8)
+    for row in range(upper_cut, H):
+        cols = np.where(red_bin[row])[0]
+        if len(cols) < 2:
+            continue
+        inside[row, int(cols[0]) : int(cols[-1]) + 1] = 1
+
+    # Fill vertically: propagate non-zero rows downward/upward using dilation
+    kv = cv2.getStructuringElement(cv2.MORPH_RECT, (1, 15))
+    inside = cv2.dilate(inside, kv)
+    return inside.astype(bool)
 
 
 def _hough_road_polygon(bgr, upper_cut: int) -> np.ndarray | None:
@@ -244,19 +323,16 @@ def make_class_masks(seg_map, bgr):
         road_mask[int(H * 0.5):, int(W * 0.1):int(W * 0.9)] = True
         print("  [WARN] sparse road mask – applied centre-bottom fallback")
 
-    # ── visual mask: use Hough polygon only when SegFormer over-detects ─────
-    # For normal images (coverage ≤ 45 %) keep the SegFormer shape as-is.
-    # For wide/flat over-detections (coverage > 45 %) apply a Hough polygon
-    # so the road tapers naturally toward the vanishing point.
+    # ── visual mask: monotonic taper (always) ────────────────────────────────
+    # Enforce that road width can only DECREASE going toward the vanishing point.
+    # When SegFormer already has a natural taper this is a no-op; when it
+    # over-detects wide flat bands (e.g. wet/reflective roads) the taper
+    # corrects the shape without affecting texture-based classification.
+    road_vis_mask = _monotonic_taper_mask(road_mask, upper_cut)
     seg_cov = road_mask.sum() / road_mask.size
-    if seg_cov > 0.45:
-        # SegFormer over-detected: apply gradient taper so the road
-        # narrows naturally toward the vanishing point.
-        road_vis_mask = _gradient_taper_mask(road_mask, upper_cut, top_frac=0.15)
-        new_cov = road_vis_mask.sum() / road_vis_mask.size
-        print(f"  [INFO] coverage high ({seg_cov:.0%}) → gradient taper applied ({new_cov:.0%})")
-    else:
-        road_vis_mask = road_mask.copy()   # SegFormer shape is fine
+    vis_cov = road_vis_mask.sum() / road_vis_mask.size
+    if abs(seg_cov - vis_cov) > 0.02:       # only log when there's a real change
+        print(f"  [INFO] monotonic taper: {seg_cov:.0%} → {vis_cov:.0%}")
 
     return sky_mask, veg_mask, road_mask, road_vis_mask
 
